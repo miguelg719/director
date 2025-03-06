@@ -3,6 +3,15 @@ import { openai } from "@ai-sdk/openai";
 import { CoreMessage, generateObject, UserContent } from "ai";
 import { z } from "zod";
 import { ObserveResult, Stagehand } from "@browserbasehq/stagehand";
+import { google } from "@ai-sdk/google";
+import { searchForTaskContext } from './search';
+import { createTaskPlan } from './planner';
+import { executeSubtask, BrowserStep } from './worker';
+import * as TaskManager from './task-manager';
+
+const LLMSearch = google("gemini-1.5-flash", {
+  useSearchGrounding: true,
+});
 
 const LLMClient = openai("gpt-4o");
 
@@ -13,6 +22,9 @@ type Step = {
   instruction: string;
 };
 
+/**
+ * Executes browser automation commands via Stagehand
+ */
 async function runStagehand({
   sessionID,
   method,
@@ -81,6 +93,9 @@ async function runStagehand({
   }
 }
 
+/**
+ * Generates the next action to take based on the goal, current page, and previous steps
+ */
 async function sendPrompt({
   goal,
   sessionID,
@@ -190,6 +205,9 @@ If the goal has been achieved, return "close".`,
   };
 }
 
+/**
+ * Determines the best starting URL for a given goal
+ */
 async function selectStartingUrl(goal: string) {
   const message: CoreMessage = {
     role: "user",
@@ -217,6 +235,32 @@ Return a URL that would be most effective for achieving this goal.`
   return result.object;
 }
 
+/**
+ * Validates request parameters for different action types
+ */
+function validateRequestParams(action: string, params: Record<string, any>) {
+  const requiredParams: Record<string, string[]> = {
+    'START': ['goal', 'sessionId'],
+    'GET_NEXT_STEP': ['goal', 'sessionId'],
+    'EXECUTE_STEP': ['sessionId', 'step'],
+    'PLAN_TASK': ['goal'],
+    'GET_WORKER_TASK': ['taskId', 'workerId'],
+    'EXECUTE_WORKER_TASK': ['taskId', 'workerId', 'subtaskId', 'sessionId', 'overallGoal', 'subtaskGoal', 'subtaskDescription'],
+    'GET_TASK_STATUS': ['taskId']
+  };
+
+  const missingParams = (requiredParams[action] || []).filter(param => !params[param]);
+  
+  if (missingParams.length > 0) {
+    return {
+      valid: false,
+      error: `Missing required parameters: ${missingParams.join(', ')}`
+    };
+  }
+  
+  return { valid: true };
+}
+
 export async function GET() {
   return NextResponse.json({ message: 'Agent API endpoint ready' });
 }
@@ -224,25 +268,41 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { goal, sessionId, previousSteps = [], action } = body;
+    const { 
+      action,
+      goal, 
+      sessionId, 
+      step, 
+      previousSteps, 
+      previousExtraction,
+      taskId,
+      workerId,
+      subtaskId,
+      overallGoal,
+      subtaskGoal,
+      subtaskDescription
+    } = body;
 
-    if (!sessionId) {
+    if (!action) {
       return NextResponse.json(
-        { error: 'Missing sessionId in request body' },
+        { error: 'Missing action in request body', success: false },
+        { status: 400 }
+      );
+    }
+
+    // Validate request parameters
+    const validation = validateRequestParams(action, body);
+    if (!validation.valid) {
+      return NextResponse.json(
+        { error: validation.error, success: false },
         { status: 400 }
       );
     }
 
     // Handle different action types
     switch (action) {
+      // Legacy action handlers - keep these for backward compatibility
       case 'START': {
-        if (!goal) {
-          return NextResponse.json(
-            { error: 'Missing goal in request body' },
-            { status: 400 }
-          );
-        }
-
         // Handle first step with URL selection
         const { url, reasoning } = await selectStartingUrl(goal);
         const firstStep = {
@@ -261,60 +321,218 @@ export async function POST(request: Request) {
         return NextResponse.json({ 
           success: true,
           result: firstStep,
-          steps: [firstStep],
-          done: false
+          done: false,
         });
       }
 
       case 'GET_NEXT_STEP': {
-        if (!goal) {
+        try {
+          // Get the next step from the agent
+          const { result, previousSteps: newPreviousSteps } = await sendPrompt({
+            goal,
+            sessionID: sessionId,
+            previousSteps: previousSteps || [],
+            previousExtraction
+          });
+
+          // Check if this is the final step
+          const isDone = result.tool === "CLOSE";
+
+          return NextResponse.json({
+            success: true,
+            result,
+            done: isDone,
+          });
+        } catch (error) {
+          console.error("[ERROR] Get next step failed:", error);
           return NextResponse.json(
-            { error: 'Missing goal in request body' },
-            { status: 400 }
+            { error: `Get next step failed: ${error instanceof Error ? error.message : "Unknown error"}`, success: false },
+            { status: 500 }
           );
         }
-
-        // Get the next step from the LLM
-        const { result, previousSteps: newPreviousSteps } = await sendPrompt({
-          goal,
-          sessionID: sessionId,
-          previousSteps,
-        });
-
-        return NextResponse.json({
-          success: true,
-          result,
-          steps: newPreviousSteps,
-          done: result.tool === "CLOSE"
-        });
       }
 
       case 'EXECUTE_STEP': {
-        const { step } = body;
-        if (!step) {
+        try {
+          // Execute the step using stagehand
+          const result = await runStagehand({
+            sessionID: sessionId,
+            method: step.tool,
+            instruction: step.instruction,
+          });
+
+          // Check if this is the final step
+          const isDone = step.tool === "CLOSE";
+
+          return NextResponse.json({
+            success: true,
+            result,
+            done: isDone,
+          });
+        } catch (error) {
+          console.error("[ERROR] Execute step failed:", error);
           return NextResponse.json(
-            { error: 'Missing step in request body' },
-            { status: 400 }
+            { error: `Execute step failed: ${error instanceof Error ? error.message : "Unknown error"}`, success: false },
+            { status: 500 }
           );
         }
+      }
 
-        // Execute the step using Stagehand
-        const extraction = await runStagehand({
-          sessionID: sessionId,
-          method: step.tool,
-          instruction: step.instruction,
-        });
+      // New action handlers for the planning-workers architecture
+      case 'PLAN_TASK': {
+        try {
+          // Search for relevant context
+          const { searchContext } = await searchForTaskContext(goal);
+          console.log("[VERBOSE] Search context:", searchContext);
 
-        return NextResponse.json({
-          success: true,
-          extraction,
-          done: step.tool === "CLOSE"
-        });
+          // Create a task plan using the planner
+          const plan = await createTaskPlan({ task: goal, searchContext });
+          console.log("[VERBOSE] Created plan:", plan);
+
+          // Create a task in the task manager
+          const task = TaskManager.createTask(goal, plan, sessionId);
+          console.log("[VERBOSE] Created task:", task.id);
+
+          return NextResponse.json({
+            success: true,
+            taskId: task.id,
+            plan: plan,
+          });
+        } catch (error) {
+          console.error("[ERROR] Planning failed:", error);
+          return NextResponse.json(
+            { error: `Planning failed: ${error instanceof Error ? error.message : "Unknown error"}`, success: false },
+            { status: 500 }
+          );
+        }
+      }
+
+      case 'GET_WORKER_TASK': {
+        try {
+          // Get the next available subtask for this task
+          const subtask = TaskManager.getNextAvailableSubtask(taskId);
+          console.log("[VERBOSE] Next available subtask:", subtask?.id || "none");
+
+          if (!subtask) {
+            return NextResponse.json({
+              success: true,
+              hasTask: false,
+            });
+          }
+
+          const task = TaskManager.getTask(taskId);
+          if (!task) {
+            return NextResponse.json(
+              { error: `Task not found: ${taskId}`, success: false },
+              { status: 404 }
+            );
+          }
+
+          // Return the subtask details
+          return NextResponse.json({
+            success: true,
+            hasTask: true,
+            subtaskId: subtask.id,
+            overallGoal: task.goal,
+            subtaskGoal: subtask.goal,
+            subtaskDescription: subtask.description,
+          });
+        } catch (error) {
+          console.error("[ERROR] Get worker task failed:", error);
+          return NextResponse.json(
+            { error: `Get worker task failed: ${error instanceof Error ? error.message : "Unknown error"}`, success: false },
+            { status: 500 }
+          );
+        }
+      }
+
+      case 'EXECUTE_WORKER_TASK': {
+        try {
+          // Execute the subtask
+          console.log(`[VERBOSE] Executing subtask: ${subtaskId}`);
+          const result = await executeSubtask({
+            subtaskId,
+            sessionId,
+            overallGoal,
+            subtaskGoal,
+            subtaskDescription,
+          });
+          console.log(`[VERBOSE] Subtask execution complete (${result.status}):`, result);
+
+          // Update the subtask status in the task manager
+          TaskManager.updateSubtaskStatus(
+            taskId,
+            subtaskId,
+            result.status,
+            result
+          );
+
+          return NextResponse.json({
+            success: true,
+            result,
+          });
+        } catch (error) {
+          console.error("[ERROR] Execute worker task failed:", error);
+          
+          // Mark the subtask as failed in the task manager
+          try {
+            TaskManager.updateSubtaskStatus(
+              taskId, 
+              subtaskId, 
+              'FAILED', 
+              { 
+                status: 'FAILED', 
+                steps: [], 
+                error: error instanceof Error ? error.message : "Unknown error",
+                retryCount: 0
+              }
+            );
+          } catch (updateError) {
+            console.error("[ERROR] Failed to update subtask status:", updateError);
+          }
+
+          return NextResponse.json(
+            { error: `Execute worker task failed: ${error instanceof Error ? error.message : "Unknown error"}`, success: false },
+            { status: 500 }
+          );
+        }
+      }
+
+      case 'GET_TASK_STATUS': {
+        try {
+          const task = TaskManager.getTask(taskId);
+          if (!task) {
+            return NextResponse.json(
+              { error: `Task not found: ${taskId}`, success: false },
+              { status: 404 }
+            );
+          }
+
+          const progress = TaskManager.getTaskProgressById(taskId);
+          if (!progress) {
+            return NextResponse.json(
+              { error: `Could not get progress for task: ${taskId}`, success: false },
+              { status: 500 }
+            );
+          }
+
+          return NextResponse.json({
+            success: true,
+            status: task.status,
+            progress,
+          });
+        } catch (error) {
+          console.error("[ERROR] Get task status failed:", error);
+          return NextResponse.json(
+            { error: `Get task status failed: ${error instanceof Error ? error.message : "Unknown error"}`, success: false },
+            { status: 500 }
+          );
+        }
       }
 
       default:
         return NextResponse.json(
-          { error: 'Invalid action type' },
+          { error: `Unknown action: ${action}`, success: false },
           { status: 400 }
         );
     }

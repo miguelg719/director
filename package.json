@@ -9,12 +9,13 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@ai-sdk/google": "^1.1.20",
     "@ai-sdk/openai": "^1.1.2",
-    "@ai-sdk/provider": "^1.0.6",
+    "@ai-sdk/provider": "^1.0.10",
     "@browserbasehq/sdk": "^2.0.0",
-    "@browserbasehq/stagehand": "^1.10.1",
+    "@browserbasehq/stagehand": "1.14.0-alpha-18533ad824722e4e699323248297e184bae9254e",
     "@vercel/analytics": "^1.4.1",
-    "ai": "^4.1.2",
+    "ai": "^4.1.53",
     "framer-motion": "^11.0.3",
     "jotai": "^2.11.1",
     "motion": "^12.0.3",

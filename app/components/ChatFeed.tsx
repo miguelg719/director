@@ -91,6 +91,7 @@ export default function ChatFeed({ initialMessage, onClose }: ChatFeedProps) {
       if (initialMessage && !agentStateRef.current.sessionId) {
         setIsLoading(true);
         try {
+          // 1. Create a browser session
           const sessionResponse = await fetch("/api/session", {
             method: "POST",
             headers: {
@@ -109,25 +110,45 @@ export default function ChatFeed({ initialMessage, onClose }: ChatFeedProps) {
 
           setContextId(sessionData.contextId);
 
+          // Update the session information
+          const sessionUrl = sessionData.sessionUrl.replace(
+            "https://www.browserbase.com/devtools-fullscreen/inspector.html",
+            "https://www.browserbase.com/devtools-internal-compiled/index.html"
+          );
+
           agentStateRef.current = {
             ...agentStateRef.current,
             sessionId: sessionData.sessionId,
-            sessionUrl: sessionData.sessionUrl.replace(
-              "https://www.browserbase.com/devtools-fullscreen/inspector.html",
-              "https://www.browserbase.com/devtools-internal-compiled/index.html"
-            ),
+            sessionUrl: sessionUrl,
           };
 
           setUiState({
             sessionId: sessionData.sessionId,
-            sessionUrl: sessionData.sessionUrl.replace(
-              "https://www.browserbase.com/devtools-fullscreen/inspector.html",
-              "https://www.browserbase.com/devtools-internal-compiled/index.html"
-            ),
+            sessionUrl: sessionUrl,
             steps: [],
           });
 
-          const response = await fetch("/api/agent", {
+          // Show UI message that we're starting
+          const startingStep: BrowserStep = {
+            text: "Starting task...",
+            reasoning: "The agent is preparing to execute the task",
+            tool: "WAIT" as const,
+            instruction: "Starting",
+            stepNumber: 1,
+          };
+
+          agentStateRef.current = {
+            ...agentStateRef.current,
+            steps: [startingStep],
+          };
+
+          setUiState(prev => ({
+            ...prev,
+            steps: [startingStep],
+          }));
+
+          // 2. Handle first step with URL selection (use the existing START action)
+          const startResponse = await fetch("/api/agent", {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -139,111 +160,332 @@ export default function ChatFeed({ initialMessage, onClose }: ChatFeedProps) {
             }),
           });
 
-          const data = await response.json();
+          const startData = await startResponse.json();
+          
+          if (!startData.success) {
+            throw new Error(startData.error || "Failed to start task");
+          }
+
           posthog.capture("agent_start", {
             goal: initialMessage,
             sessionId: sessionData.sessionId,
             contextId: sessionData.contextId,
           });
 
-          if (data.success) {
-            const newStep = {
-              text: data.result.text,
-              reasoning: data.result.reasoning,
-              tool: data.result.tool,
-              instruction: data.result.instruction,
-              stepNumber: 1,
-            };
+          // Update UI with the first step (showing the URL navigation to the user)
+          const firstStep = {
+            ...startData.result,
+            stepNumber: 1,
+          };
 
-            agentStateRef.current = {
-              ...agentStateRef.current,
-              steps: [newStep],
-            };
+          agentStateRef.current = {
+            ...agentStateRef.current,
+            steps: [firstStep],
+          };
 
-            setUiState((prev) => ({
-              ...prev,
-              steps: [newStep],
-            }));
+          setUiState(prev => ({
+            ...prev,
+            steps: [firstStep],
+          }));
 
-            // Continue with subsequent steps
-            while (true) {
-              // Get next step from LLM
-              const nextStepResponse = await fetch("/api/agent", {
+          // Create a plan in the background (for internal execution)
+          console.log("[VERBOSE] Creating plan...");
+          const planResponse = await fetch("/api/agent", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              goal: initialMessage,
+              sessionId: sessionData.sessionId,
+              action: "PLAN_TASK",
+            }),
+          });
+
+          const planData = await planResponse.json();
+          
+          if (!planData.success) {
+            console.error("[ERROR] Failed to create plan:", planData.error);
+            // Continue with the legacy flow if planning fails
+            await legacyStepExecution(sessionData, initialMessage);
+            return;
+          }
+
+          console.log("[VERBOSE] Plan created:", planData);
+          
+          // 3. Execute the plan using the worker architecture
+          let taskCompleted = false;
+          const taskId = planData.taskId;
+          let visibleSteps = [...agentStateRef.current.steps];
+          let stepCounter = visibleSteps.length;
+
+          while (!taskCompleted) {
+            // Request a worker task
+            const workerResponse = await fetch("/api/agent", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                taskId,
+                workerId: "worker-1",
+                action: "GET_WORKER_TASK",
+              }),
+            });
+
+            const workerData = await workerResponse.json();
+
+            if (!workerData.success) {
+              console.error("[ERROR] Failed to get worker task:", workerData.error);
+              throw new Error(workerData.error || "Failed to get worker task");
+            }
+
+            // Check if there are no more tasks
+            if (!workerData.hasTask) {
+              // Check task status
+              const statusResponse = await fetch("/api/agent", {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
-                  goal: initialMessage,
-                  sessionId: sessionData.sessionId,
-                  previousSteps: agentStateRef.current.steps,
-                  action: "GET_NEXT_STEP",
+                  taskId,
+                  action: "GET_TASK_STATUS",
                 }),
               });
 
-              const nextStepData = await nextStepResponse.json();
-
-              if (!nextStepData.success) {
-                throw new Error("Failed to get next step");
+              const statusData = await statusResponse.json();
+              
+              if (statusData.status === 'DONE' || statusData.status === 'FAILED') {
+                taskCompleted = true;
+                console.log(`[VERBOSE] Task ${statusData.status.toLowerCase()}`);
+                
+                if (statusData.status === 'DONE') {
+                  // Add a final step only if not already completed
+                  if (!visibleSteps.some(step => step.tool === "CLOSE")) {
+                    const finalStep: BrowserStep = {
+                      text: "Task completed successfully",
+                      reasoning: "The agent has completed all subtasks",
+                      tool: "CLOSE" as const,
+                      instruction: "Closing session",
+                      stepNumber: ++stepCounter,
+                    };
+                    
+                    visibleSteps.push(finalStep);
+                    agentStateRef.current = {
+                      ...agentStateRef.current,
+                      steps: visibleSteps,
+                    };
+                    
+                    setUiState(prev => ({
+                      ...prev,
+                      steps: visibleSteps,
+                    }));
+                  }
+                }
+                
+                setIsAgentFinished(true);
               }
+              
+              // Wait a bit before checking again
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              continue;
+            }
 
-              // Add the next step to UI immediately after receiving it
-              const nextStep = {
-                ...nextStepData.result,
-                stepNumber: agentStateRef.current.steps.length + 1,
-              };
-
-              agentStateRef.current = {
-                ...agentStateRef.current,
-                steps: [...agentStateRef.current.steps, nextStep],
-              };
-
-              setUiState((prev) => ({
-                ...prev,
-                steps: agentStateRef.current.steps,
-              }));
-
-              // Break after adding the CLOSE step to UI
-              if (nextStepData.done || nextStepData.result.tool === "CLOSE") {
-                break;
-              }
-
-              // Execute the step
-              const executeResponse = await fetch("/api/agent", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  sessionId: sessionData.sessionId,
-                  step: nextStepData.result,
-                  action: "EXECUTE_STEP",
-                }),
-              });
-
-              const executeData = await executeResponse.json();
-
-              posthog.capture("agent_execute_step", {
-                goal: initialMessage,
+            // Execute the subtask
+            console.log(`[VERBOSE] Executing subtask: ${workerData.subtaskId}`, workerData);
+            const { subtaskId, overallGoal, subtaskGoal, subtaskDescription } = workerData;
+            
+            const executeResponse = await fetch("/api/agent", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                taskId,
+                workerId: "worker-1",
+                subtaskId,
                 sessionId: sessionData.sessionId,
-                contextId: sessionData.contextId,
-                step: nextStepData.result,
-              });
+                overallGoal,
+                subtaskGoal,
+                subtaskDescription,
+                action: "EXECUTE_WORKER_TASK",
+              }),
+            });
 
-              if (!executeData.success) {
-                throw new Error("Failed to execute step");
-              }
+            const executeData = await executeResponse.json();
+            
+            if (!executeData.success) {
+              console.error("[ERROR] Failed to execute worker task:", executeData.error);
+              throw new Error(executeData.error || "Failed to execute worker task");
+            }
 
-              if (executeData.done) {
-                break;
+            console.log(`[VERBOSE] Subtask ${subtaskId} completed:`, executeData.result);
+
+            posthog.capture("agent_subtask_complete", {
+              goal: initialMessage,
+              sessionId: sessionData.sessionId,
+              contextId: sessionData.contextId,
+              taskId,
+              subtaskId,
+              status: executeData.result.status,
+            });
+
+            // Update UI with visible steps from this subtask
+            // We'll only show the most important steps to the user
+            const subtaskSteps = executeData.result.steps;
+            if (subtaskSteps && subtaskSteps.length > 0) {
+              // Filter to just show non-internal steps (ACT, EXTRACT, GOTO) to the user
+              const visibleSubtaskSteps = subtaskSteps
+                .filter((step: BrowserStep) => 
+                  ["ACT", "EXTRACT", "GOTO", "CLOSE"].includes(step.tool))
+                .map((step: BrowserStep, i: number) => ({
+                  ...step,
+                  stepNumber: stepCounter + i + 1
+                }));
+                
+              if (visibleSubtaskSteps.length > 0) {
+                stepCounter += visibleSubtaskSteps.length;
+                visibleSteps = [...visibleSteps, ...visibleSubtaskSteps];
+                
+                agentStateRef.current = {
+                  ...agentStateRef.current,
+                  steps: visibleSteps,
+                };
+                
+                setUiState(prev => ({
+                  ...prev,
+                  steps: visibleSteps,
+                }));
               }
             }
           }
-        } catch (error) {
+        } catch (error: unknown) {
           console.error("Session initialization error:", error);
+          
+          // Attempt to execute using the legacy flow if there's an error
+          if (agentStateRef.current.sessionId) {
+            try {
+              await legacyStepExecution(
+                { sessionId: agentStateRef.current.sessionId, contextId: contextId },
+                initialMessage
+              );
+              return;
+            } catch (fallbackError) {
+              console.error("Legacy execution also failed:", fallbackError);
+            }
+          }
+          
+          const errorStep: BrowserStep = {
+            text: `Error: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
+            reasoning: "The agent encountered an error",
+            tool: "CLOSE" as const,
+            instruction: "Error",
+            stepNumber: agentStateRef.current.steps.length + 1,
+          };
+          
+          agentStateRef.current = {
+            ...agentStateRef.current,
+            steps: [...agentStateRef.current.steps, errorStep],
+          };
+
+          setUiState(prev => ({
+            ...prev,
+            steps: [...agentStateRef.current.steps],
+          }));
+          
+          setIsAgentFinished(true);
         } finally {
           setIsLoading(false);
         }
+      }
+    };
+
+    // Legacy step execution for backward compatibility
+    const legacyStepExecution = async (
+      sessionData: { sessionId: string, contextId: string },
+      goal: string
+    ) => {
+      console.log("[VERBOSE] Falling back to legacy execution");
+      try {
+        // Continue with legacy workflow using GET_NEXT_STEP and EXECUTE_STEP actions
+        while (true) {
+          // Get next step from LLM
+          const nextStepResponse = await fetch("/api/agent", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              goal,
+              sessionId: sessionData.sessionId,
+              previousSteps: agentStateRef.current.steps,
+              action: "GET_NEXT_STEP",
+            }),
+          });
+
+          const nextStepData = await nextStepResponse.json();
+
+          if (!nextStepData.success) {
+            throw new Error("Failed to get next step");
+          }
+
+          // Add step number and add to steps array
+          const nextStep = {
+            ...nextStepData.result,
+            stepNumber: agentStateRef.current.steps.length + 1,
+          };
+
+          agentStateRef.current = {
+            ...agentStateRef.current,
+            steps: [...agentStateRef.current.steps, nextStep],
+          };
+
+          setUiState(prev => ({
+            ...prev,
+            steps: [...agentStateRef.current.steps],
+          }));
+
+          // Break after adding the CLOSE step to UI
+          if (nextStepData.done || nextStepData.result.tool === "CLOSE") {
+            setIsAgentFinished(true);
+            break;
+          }
+
+          // Execute the step
+          const executeResponse = await fetch("/api/agent", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              sessionId: sessionData.sessionId,
+              step: nextStepData.result,
+              action: "EXECUTE_STEP",
+            }),
+          });
+
+          const executeData = await executeResponse.json();
+
+          posthog.capture("agent_execute_step", {
+            goal,
+            sessionId: sessionData.sessionId,
+            contextId: sessionData.contextId,
+            step: nextStepData.result,
+          });
+
+          if (!executeData.success) {
+            throw new Error("Failed to execute step");
+          }
+
+          if (executeData.done) {
+            setIsAgentFinished(true);
+            break;
+          }
+        }
+      } catch (error) {
+        console.error("Legacy execution error:", error);
+        throw error;
       }
     };
 
