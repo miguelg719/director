@@ -448,6 +448,33 @@ export async function POST(request: Request) {
 
       case 'EXECUTE_WORKER_TASK': {
         try {
+          // Get the full task information to provide context
+          const task = TaskManager.getTask(taskId);
+          if (!task) {
+            return NextResponse.json(
+              { error: `Task not found: ${taskId}`, success: false },
+              { status: 404 }
+            );
+          }
+
+          // Get the complete plan with all subtasks for context
+          const taskPlan = task.plan;
+          
+          // Get information about other subtasks to provide context
+          const otherSubtasks = taskPlan.subtasks
+            .filter(st => st.id !== subtaskId)
+            .map(st => ({
+              id: st.id,
+              goal: st.goal,
+              description: st.description,
+              dependencies: st.dependencies,
+              status: st.status
+            }));
+          
+          // Find this subtask's position in the overall plan
+          const subtaskIndex = taskPlan.subtasks.findIndex(st => st.id === subtaskId);
+          const totalSubtasks = taskPlan.subtasks.length;
+          
           // Execute the subtask
           console.log(`[VERBOSE] Executing subtask: ${subtaskId}`);
           const result = await executeSubtask({
@@ -456,6 +483,12 @@ export async function POST(request: Request) {
             overallGoal,
             subtaskGoal,
             subtaskDescription,
+            taskPlan: {
+              planDescription: taskPlan.summary,
+              subtaskPosition: subtaskIndex + 1,
+              totalSubtasks,
+              otherSubtasks
+            }
           });
           console.log(`[VERBOSE] Subtask execution complete (${result.status}):`, result);
 

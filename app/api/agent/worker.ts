@@ -69,7 +69,10 @@ async function runStagehand({
 
       case "ACT":
         console.log(`[WORKER:${subtaskId}] Performing action: ${instruction}`);
-        await page.act(instruction!);
+        await page.act({
+            action: instruction!,
+            slowDomBasedAct: false,
+        }!);
         break;
 
       case "EXTRACT": {
@@ -82,7 +85,6 @@ async function runStagehand({
         console.log(`[WORKER:${subtaskId}] Observing with instruction: ${instruction || "none"}`);
         return await page.observe({
           instruction,
-          useAccessibilityTree: true,
         });
 
       case "CLOSE":
@@ -130,6 +132,7 @@ async function runStagehand({
  * @param overallGoal The overall task goal 
  * @param subtaskGoal The specific goal for this subtask
  * @param subtaskDescription A description of the subtask
+ * @param taskPlan Optional context about how this subtask fits into the overall plan
  * @param previousExtraction Optional data extracted from a previous subtask
  * @param maxRetries Maximum number of retries for failed steps
  * @returns The result of the subtask execution
@@ -140,6 +143,7 @@ export async function executeSubtask({
   overallGoal,
   subtaskGoal,
   subtaskDescription,
+  taskPlan,
   previousExtraction,
   maxRetries = 3
 }: {
@@ -148,11 +152,26 @@ export async function executeSubtask({
   overallGoal: string;
   subtaskGoal: string;
   subtaskDescription: string;
+  taskPlan?: {
+    planDescription?: string;
+    subtaskPosition?: number;
+    totalSubtasks?: number;
+    otherSubtasks?: Array<{
+      id: string;
+      goal: string;
+      description: string;
+      dependencies?: string[];
+      status?: string;
+    }>;
+  };
   previousExtraction?: string | any;
   maxRetries?: number;
 }): Promise<WorkerResult> {
   console.log(`[WORKER:${subtaskId}] Executing subtask ${subtaskId}`);
   console.log(`[WORKER:${subtaskId}] Goal: ${subtaskGoal}`);
+  if (taskPlan) {
+    console.log(`[WORKER:${subtaskId}] Position: ${taskPlan.subtaskPosition || '?'}/${taskPlan.totalSubtasks || '?'}`);
+  }
   
   let steps: BrowserStep[] = [];
   let extraction: any = null;
@@ -193,22 +212,23 @@ export async function executeSubtask({
     // Get the current URL for context
     let currentUrl = '';
     try {
-      const currentUrlResult = await executeStep({
-        sessionId,
-        subtaskId,
-        step: {
-          text: "Getting current URL",
-          reasoning: "Need to know current state",
-          tool: "EXTRACT",
-          instruction: "return document.location.href",
-        }
-      });
+        throw new Error("Not implemented");
+    //   const currentUrlResult = await executeStep({
+    //     sessionId,
+    //     subtaskId,
+    //     step: {
+    //       text: "Getting current URL",
+    //       reasoning: "Need to know current state",
+    //       tool: "EXTRACT",
+    //       instruction: "return document.location.href",
+    //     }
+    //   });
       
-      if (typeof currentUrlResult === 'string') {
-        currentUrl = currentUrlResult;
-      } else if (Array.isArray(currentUrlResult) && currentUrlResult.length > 0) {
-        currentUrl = currentUrlResult[0].toString();
-      }
+    //   if (typeof currentUrlResult === 'string') {
+    //     currentUrl = currentUrlResult;
+    //   } else if (Array.isArray(currentUrlResult) && currentUrlResult.length > 0) {
+    //     currentUrl = currentUrlResult[0].toString();
+    //   }
     } catch (e) {
       console.warn(`[WORKER:${subtaskId}] Failed to get current URL, continuing without it`);
       currentUrl = 'unknown';
@@ -256,6 +276,7 @@ export async function executeSubtask({
           overallGoal,
           subtaskGoal,
           subtaskDescription,
+          taskPlan,
           previousSteps: steps,
           currentUrl,
           previousExtraction,
@@ -599,6 +620,7 @@ async function getNextStep({
   overallGoal,
   subtaskGoal,
   subtaskDescription,
+  taskPlan,
   previousSteps = [],
   currentUrl,
   previousExtraction,
@@ -609,6 +631,18 @@ async function getNextStep({
   overallGoal: string;
   subtaskGoal: string;
   subtaskDescription: string;
+  taskPlan?: {
+    planDescription?: string;
+    subtaskPosition?: number;
+    totalSubtasks?: number;
+    otherSubtasks?: Array<{
+      id: string;
+      goal: string;
+      description: string;
+      dependencies?: string[];
+      status?: string;
+    }>;
+  };
   previousSteps: BrowserStep[];
   currentUrl: string;
   previousExtraction?: string | any;
@@ -616,10 +650,29 @@ async function getNextStep({
 }): Promise<BrowserStep> {
   // Prepare the text prompt
   const textPrompt = `
-OVERALL GOAL: ${overallGoal}
-SUBTASK GOAL: ${subtaskGoal}
+OVERALL TASK GOAL: ${overallGoal}
+${taskPlan?.planDescription ? `PLAN DESCRIPTION: ${taskPlan.planDescription}` : ''}
+
+YOUR SUBTASK GOAL: ${subtaskGoal}
 SUBTASK DESCRIPTION: ${subtaskDescription}
-${previousSteps.length > 0 ? `\nPREVIOUS STEPS:
+${taskPlan?.subtaskPosition ? `YOUR SUBTASK POSITION: ${taskPlan.subtaskPosition} of ${taskPlan.totalSubtasks || '?'}` : ''}
+
+HOW THIS SUBTASK FITS INTO THE OVERALL PLAN:
+This subtask is one part of achieving the overall goal. Your work will contribute to the larger task by:
+- Helping gather necessary information for later steps
+- Setting up foundations that other subtasks will build upon
+- Working towards the end result in a systematic way
+
+${taskPlan?.otherSubtasks && taskPlan.otherSubtasks.length > 0 ? `
+OTHER SUBTASKS IN THE PLAN:
+${taskPlan.otherSubtasks.map(st => `- ${st.goal}${st.dependencies?.includes(subtaskId) ? ' (depends on your subtask)' : ''}`).join('\n')}
+` : ''}
+
+Even if your subtask instructions seem vague, consider how they relate to the overall goal.
+You should adapt your approach based on what you observe in the current state of the browser.
+If you encounter unexpected situations, think about what would be most helpful for the overall task.
+
+${previousSteps.length > 0 ? `\nPREVIOUS STEPS YOU'VE TAKEN:
 ${previousSteps.map((step, i) => `Step ${i + 1}: ${step.text}
 Tool: ${step.tool}
 Instruction: ${step.instruction}
@@ -645,6 +698,15 @@ Determine the next step to achieve the subtask goal. Remember:
 
 IMPORTANT: Use the DONE tool when the subtask is complete with a message explaining what was accomplished.
 Use the FAIL tool when the subtask has encountered a critical error that cannot be resolved.
+
+REFLECTION BEFORE ACTING:
+Before deciding on your next action, reflect on these questions:
+1. What is the current state of the browser (based on the screenshot)?
+2. How does this current state relate to my subtask goal?
+3. What is the most direct path to completing my subtask from here?
+4. How will my completion of this subtask help the overall task?
+5. Are there any potential obstacles I should anticipate?
+6. How should I adapt if my expected path is blocked?
 
 You are provided with a screenshot of the current page state. This screenshot is updated after each action you take, so it always reflects the current state of the page. 
 EXAMINE the screenshot CAREFULLY before deciding your next action. The screenshot contains the most accurate information about the page.
@@ -690,7 +752,7 @@ Respond in the following format:
       messages,
       schema: z.object({
         text: z.string().describe("A concise description of what action to take next"),
-        reasoning: z.string().describe("Your reasoning for choosing this action, referring specifically to what you observe in the screenshot"),
+        reasoning: z.string().describe("Your reasoning for choosing this action, referring specifically to what you observe in the screenshot and how it relates to the overall task"),
         tool: z.enum(["GOTO", "ACT", "EXTRACT", "OBSERVE", "CLOSE", "WAIT", "NAVBACK", "SCREENSHOT", "DONE", "FAIL"]).describe("The tool to use for this step"),
         instruction: z.string().describe("The specific instruction for the selected tool")
       }),
